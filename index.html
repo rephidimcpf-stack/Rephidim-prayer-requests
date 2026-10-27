@@ -444,7 +444,7 @@
 (function () {
   'use strict';
 
-  var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxjuEH9lcuXd3jdKPwVulpXImb7OwwywjiW3XQhbqsIOOxe6fL6_3v8qt_VF1CbcaU6/exec';
+  var APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzkRtexK1o3qIZ4s5LLgp-1EPvniwuzLVmOMm9JIFJ3_vTpLVGvcfjtHf3LrqMe6KU/exec';
 
   var MAX_SEC = 90;
   var STEPS = ['step-idle','step-rec','step-review','step-sending','step-done'];
@@ -455,6 +455,8 @@
   var lastPayload = null;
   var alreadySent = false;
   var hasSubmitted = false; // hard one-shot: only one POST per recording
+  var stepBeforeSend = 'step-idle';   // where to go back to if the server says no
+  var lastTextSig = null;             // so a refused text can be sent again
 
   // Remembers the exact text already sent, so the SAME typed request cannot go twice.
   var sentTexts = loadSentTexts();
@@ -614,8 +616,11 @@
     return 'r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
   }
 
+  /* Send one payload and report what the server actually answered.
+     Apps Script replies with JSON and allows CORS, so the answer can be read.
+     Only if fetch itself is blocked do we fall back to the hidden form POST —
+     and that path is the only one where the outcome is unknown. */
   function submit(payload){
-    // Hard block: only ONE real POST allowed per recording
     if (hasSubmitted) {
       showErr('పంపబడింది');
       return false;
@@ -623,6 +628,10 @@
     if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.indexOf('PASTE_') === 0){
       showErr('సెటప్ పూర్తికాలేదు.');
       return false;
+    }
+
+    for (var i = 0; i < STEPS.length; i++){
+      if (!$(STEPS[i]).classList.contains('hidden')) stepBeforeSend = STEPS[i];
     }
 
     hasSubmitted = true;
@@ -635,16 +644,59 @@
 
     try { $('player').pause(); } catch (e) {}
 
-    // Single form POST only (reliable with Google Apps Script)
+    var body = 'payload=' + encodeURIComponent(JSON.stringify(payload));
+
+    fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body
+    })
+      .then(function (r) { return r.text(); })
+      .then(function (t) {
+        var d = null;
+        try { d = JSON.parse(t); } catch (e) {}
+        if (d && d.ok) {
+          show('step-done');
+          setTimeout(resetAll, 2500);
+          return;
+        }
+        refused(d && d.error ? String(d.error) : 'UNKNOWN');
+      })
+      .catch(function () { postViaForm(payload); });
+
+    return true;
+  }
+
+  /* The server said no (or gave nothing usable): say why, allow a retry. */
+  function refused(code){
+    hasSubmitted = false;
+    alreadySent = false;
+    awaitingPost = false;
+    setSendEnabled(true);
+    if (lastTextSig){ delete sentTexts[lastTextSig]; saveSentTexts(); lastTextSig = null; }
+    show(stepBeforeSend);
+    var msg;
+    if (code === 'EMPTY'){
+      msg = 'ఏదైనా రాయండి.';
+    } else if (code === 'AUDIO_TOO_LARGE'){
+      msg = 'వాయిస్ చాలా పెద్దది — చిన్నగా రికార్డ్ చేసి మళ్ళీ పంపండి.';
+    } else if (code === 'NO_SPREADSHEET'){
+      msg = 'సర్వర్ కి షీట్ దొరకలేదు — SHEET_ID సరిచూడండి.';
+    } else {
+      msg = 'పంపలేకపోయాము (' + code + '). మళ్ళీ ప్రయత్నించండి.';
+    }
+    showErr(msg);
+  }
+
+  /* Old browsers that block fetch: hidden form POST. The answer cannot be
+     read this way, so this is the one path that reports success on faith. */
+  function postViaForm(payload){
     var form = $('postForm');
     form.action = APPS_SCRIPT_URL;
     $('postPayload').value = JSON.stringify(payload);
 
     awaitingPost = true;
     if (postTimer) clearTimeout(postTimer);
-
-    // Success path: iframe load
-    // Fallback success after 8s if iframe doesn't fire
     postTimer = setTimeout(function () {
       if (awaitingPost) {
         awaitingPost = false;
@@ -654,9 +706,7 @@
     }, 8000);
 
     form.submit();
-    // Clear so it cannot be posted again
     setTimeout(function () { try { $('postPayload').value = ''; } catch (e) {} }, 300);
-    return true;
   }
 
   function send(){
@@ -716,6 +766,7 @@
 
     alreadySent = true;
     setSendEnabled(false);
+    lastTextSig = sig;
     var ok = submit({
       name: name,
       message: message,
